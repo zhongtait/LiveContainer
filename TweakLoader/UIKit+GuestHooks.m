@@ -9,6 +9,83 @@ UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
 BOOL launchURLProcessed = NO;
 
+// LC_GUEST_ORIENTATION_DYNAMIC_V1: dynamic orientation engine
+static inline void safeSwizzle(Class class, SEL originalAction, SEL swizzledAction) {
+    Method origMethod = class_getInstanceMethod(class, originalAction);
+    Method swizzMethod = class_getInstanceMethod(class, swizzledAction);
+    if (!origMethod || !swizzMethod) return;
+    BOOL didAddMethod = class_addMethod(class,
+                                        originalAction,
+                                        method_getImplementation(swizzMethod),
+                                        method_getTypeEncoding(swizzMethod));
+    if (didAddMethod) {
+        class_replaceMethod(class,
+                            swizzledAction,
+                            method_getImplementation(origMethod),
+                            method_getTypeEncoding(origMethod));
+    } else {
+        method_exchangeImplementations(origMethod, swizzMethod);
+    }
+}
+
+static inline void addOrSwizzleMethod(Class cls, SEL origSel, SEL swizzSel) {
+    Method swizzMethod = class_getInstanceMethod(cls, swizzSel);
+    if (!swizzMethod) return;
+    Method origMethod = class_getInstanceMethod(cls, origSel);
+    if (!origMethod) {
+        class_addMethod(cls, origSel, method_getImplementation(swizzMethod), method_getTypeEncoding(swizzMethod));
+    } else {
+        safeSwizzle(cls, origSel, swizzSel);
+    }
+}
+
+static UIInterfaceOrientation LCDynamicOrientation = UIInterfaceOrientationUnknown;
+static BOOL LCDynamicOrientationActive = NO;
+
+static void LCApplyDynamicOrientation(UIInterfaceOrientation orientation) {
+    if (orientation == UIInterfaceOrientationUnknown) {
+        LCDynamicOrientation = UIInterfaceOrientationUnknown;
+        LCDynamicOrientationActive = NO;
+    } else {
+        LCDynamicOrientation = orientation;
+        LCDynamicOrientationActive = YES;
+    }
+
+    void (^applyBlock)(void) = ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:UIDeviceOrientationDidChangeNotification
+                                                            object:UIDevice.currentDevice];
+
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) continue;
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+
+            for (UIWindow *window in windowScene.windows) {
+                UIViewController *rootVC = window.rootViewController;
+                if ([rootVC respondsToSelector:@selector(setNeedsUpdateOfSupportedInterfaceOrientations)]) {
+                    [rootVC setNeedsUpdateOfSupportedInterfaceOrientations];
+                }
+
+                if ([window respondsToSelector:@selector(setAutorotates:forceUpdateInterfaceOrientation:)]) {
+                    [window setAutorotates:YES forceUpdateInterfaceOrientation:YES];
+                }
+                if ([window respondsToSelector:@selector(_forceUpdateInterfaceOrientationIncludingRetargeting:)]) {
+                    [window _forceUpdateInterfaceOrientationIncludingRetargeting:YES];
+                }
+            }
+        }
+
+        [UIViewController attemptRotationToDeviceOrientation];
+    };
+
+    if ([NSThread isMainThread]) {
+        applyBlock();
+        dispatch_async(dispatch_get_main_queue(), applyBlock);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), applyBlock);
+    }
+}
+
+
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) return;
@@ -19,6 +96,34 @@ static void UIKitGuestHooksInit() {
     swizzle(UIApplication.class, @selector(setDelegate:), @selector(hook_setDelegate:));
     swizzle(UIScene.class, @selector(scene:didReceiveActions:fromTransitionContext:), @selector(hook_scene:didReceiveActions:fromTransitionContext:));
     swizzle(UIScene.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
+
+    // LC_GUEST_ORIENTATION_DYNAMIC_V1: swizzle window, controller, device, scene & application hooks
+    safeSwizzle(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_makeKeyAndVisible));
+    safeSwizzle(UIWindow.class, @selector(makeKeyWindow), @selector(hook_makeKeyWindow));
+    safeSwizzle(UIWindow.class, @selector(resignKeyWindow), @selector(hook_resignKeyWindow));
+    safeSwizzle(UIWindow.class, @selector(setHidden:), @selector(hook_setHidden:));
+    safeSwizzle(UIWindow.class, @selector(setAutorotates:forceUpdateInterfaceOrientation:), @selector(hook_setAutorotates:forceUpdateInterfaceOrientation:));
+
+    addOrSwizzleMethod(UIViewController.class, @selector(supportedInterfaceOrientations), @selector(hook_supportedInterfaceOrientations));
+    addOrSwizzleMethod(UIViewController.class, @selector(__supportedInterfaceOrientations), @selector(hook___supportedInterfaceOrientations));
+    addOrSwizzleMethod(UIViewController.class, @selector(shouldAutorotate), @selector(hook_shouldAutorotate));
+    addOrSwizzleMethod(UIViewController.class, @selector(preferredInterfaceOrientationForPresentation), @selector(hook_preferredInterfaceOrientationForPresentation));
+    addOrSwizzleMethod(UIViewController.class, @selector(shouldAutorotateToInterfaceOrientation:), @selector(hook_shouldAutorotateToInterfaceOrientation:));
+    safeSwizzle(UIViewController.class, @selector(viewDidAppear:), @selector(hook_viewDidAppear:));
+    safeSwizzle(UIViewController.class, @selector(viewWillDisappear:), @selector(hook_viewWillDisappear:));
+
+    safeSwizzle(UIDevice.class, @selector(orientation), @selector(hook_orientation));
+    safeSwizzle(UIDevice.class, @selector(setValue:forKey:), @selector(hook_setValue:forKey:));
+    addOrSwizzleMethod(UIDevice.class, @selector(setOrientation:animated:), @selector(hook_setOrientation:animated:));
+    addOrSwizzleMethod(UIDevice.class, @selector(setOrientation:), @selector(hook_setOrientation:));
+
+    if (@available(iOS 16.0, *)) {
+        safeSwizzle(UIWindowScene.class, @selector(requestGeometryUpdateWithPreferences:errorHandler:), @selector(hook_requestGeometryUpdateWithPreferences:errorHandler:));
+    }
+    safeSwizzle(UIWindowScene.class, @selector(interfaceOrientation), @selector(hook_interfaceOrientation));
+    safeSwizzle(UIApplication.class, @selector(statusBarOrientation), @selector(hook_statusBarOrientation));
+    safeSwizzle(UIApplication.class, @selector(supportedInterfaceOrientationsForWindow:), @selector(hook_supportedInterfaceOrientationsForWindow:));
+
     NSInteger LCOrientationLockDirection = [NSUserDefaults.guestAppInfo[@"LCOrientationLock"] integerValue];
     if(LCOrientationLockDirection != 0 && [UIDevice.currentDevice userInterfaceIdiom] == UIUserInterfaceIdiomPhone) {
         switch (LCOrientationLockDirection) {
@@ -730,24 +835,196 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 
 
 
-@implementation UIViewController(LiveContainerHook)
-
-- (UIInterfaceOrientationMask)hook___supportedInterfaceOrientations {
-    if(LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
+// LC_GUEST_ORIENTATION_DYNAMIC_V1: implementation hooks
+@implementation UIViewController (LiveContainerOrientationHook)
+- (UIInterfaceOrientationMask)hook_supportedInterfaceOrientations {
+    if (LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
         return UIInterfaceOrientationMaskLandscape;
-    } else {
+    } else if (LCOrientationLock == UIInterfaceOrientationPortrait) {
         return UIInterfaceOrientationMaskPortrait;
     }
+    if (LCDynamicOrientationActive) {
+        if (UIInterfaceOrientationIsLandscape(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskLandscape;
+        } else if (UIInterfaceOrientationIsPortrait(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskPortrait;
+        }
+    }
+    return [self hook_supportedInterfaceOrientations];
+}
 
+- (UIInterfaceOrientationMask)hook___supportedInterfaceOrientations {
+    if (LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
+        return UIInterfaceOrientationMaskLandscape;
+    } else if (LCOrientationLock == UIInterfaceOrientationPortrait) {
+        return UIInterfaceOrientationMaskPortrait;
+    }
+    if (LCDynamicOrientationActive) {
+        if (UIInterfaceOrientationIsLandscape(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskLandscape;
+        } else if (UIInterfaceOrientationIsPortrait(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskPortrait;
+        }
+    }
+    return [self hook___supportedInterfaceOrientations];
+}
+
+- (BOOL)hook_shouldAutorotate {
+    return YES;
+}
+
+- (UIInterfaceOrientation)hook_preferredInterfaceOrientationForPresentation {
+    if (LCOrientationLock != UIInterfaceOrientationUnknown) {
+        return LCOrientationLock;
+    }
+    if (LCDynamicOrientationActive && LCDynamicOrientation != UIInterfaceOrientationUnknown) {
+        return LCDynamicOrientation;
+    }
+    return [self hook_preferredInterfaceOrientationForPresentation];
 }
 
 - (BOOL)hook_shouldAutorotateToInterfaceOrientation:(NSInteger)orientation {
     return YES;
 }
 
+- (void)hook_viewDidAppear:(BOOL)animated {
+    [self hook_viewDidAppear:animated];
+    if (LCDynamicOrientationActive) {
+        if ([self respondsToSelector:@selector(setNeedsUpdateOfSupportedInterfaceOrientations)]) {
+            [self setNeedsUpdateOfSupportedInterfaceOrientations];
+        }
+    }
+}
+
+- (void)hook_viewWillDisappear:(BOOL)animated {
+    [self hook_viewWillDisappear:animated];
+    if (self.isBeingDismissed && LCDynamicOrientationActive) {
+        LCApplyDynamicOrientation(UIInterfaceOrientationUnknown);
+    }
+}
 @end
 
-@implementation UIWindow(hook)
+@implementation UIDevice (LiveContainerOrientationHook)
+- (UIDeviceOrientation)hook_orientation {
+    if (LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
+        return UIDeviceOrientationLandscapeLeft;
+    } else if (LCOrientationLock == UIInterfaceOrientationPortrait) {
+        return UIDeviceOrientationPortrait;
+    }
+    if (LCDynamicOrientationActive) {
+        if (LCDynamicOrientation == UIInterfaceOrientationLandscapeRight) {
+            return UIDeviceOrientationLandscapeLeft;
+        } else if (LCDynamicOrientation == UIInterfaceOrientationLandscapeLeft) {
+            return UIDeviceOrientationLandscapeRight;
+        } else if (LCDynamicOrientation == UIInterfaceOrientationPortrait) {
+            return UIDeviceOrientationPortrait;
+        } else if (LCDynamicOrientation == UIInterfaceOrientationPortraitUpsideDown) {
+            return UIDeviceOrientationPortraitUpsideDown;
+        }
+    }
+    return [self hook_orientation];
+}
+
+- (void)hook_setValue:(id)value forKey:(NSString *)key {
+    if ([key isEqualToString:@"orientation"]) {
+        NSInteger val = [value integerValue];
+        if (val == UIInterfaceOrientationLandscapeRight || val == UIInterfaceOrientationLandscapeLeft ||
+            val == 3 || val == 4) {
+            LCApplyDynamicOrientation(UIInterfaceOrientationLandscapeRight);
+        } else if (val == UIInterfaceOrientationPortrait || val == UIInterfaceOrientationPortraitUpsideDown ||
+                   val == 1 || val == 2) {
+            LCApplyDynamicOrientation(UIInterfaceOrientationPortrait);
+        } else {
+            LCApplyDynamicOrientation(UIInterfaceOrientationUnknown);
+        }
+        return;
+    }
+    [self hook_setValue:value forKey:key];
+}
+
+- (void)hook_setOrientation:(UIInterfaceOrientation)orientation animated:(BOOL)animated {
+    LCApplyDynamicOrientation(orientation);
+}
+
+- (void)hook_setOrientation:(UIInterfaceOrientation)orientation {
+    LCApplyDynamicOrientation(orientation);
+}
+@end
+
+@implementation UIWindowScene (LiveContainerGeometryHook)
+- (void)hook_requestGeometryUpdateWithPreferences:(id)preferences errorHandler:(void (^)(NSError *error))errorHandler {
+    UIInterfaceOrientationMask targetMask = 0;
+    @try {
+        id val = [preferences valueForKey:@"interfaceOrientations"];
+        if (val) {
+            targetMask = (UIInterfaceOrientationMask)[val unsignedIntegerValue];
+        }
+    } @catch (NSException *e) {
+    }
+
+    BOOL hasLandscape = (targetMask & UIInterfaceOrientationMaskLandscape) != 0;
+    BOOL hasPortrait = (targetMask & (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown)) != 0;
+
+    if (hasLandscape && !hasPortrait) {
+        LCApplyDynamicOrientation(UIInterfaceOrientationLandscapeRight);
+    } else if (hasPortrait && !hasLandscape) {
+        LCApplyDynamicOrientation(UIInterfaceOrientationPortrait);
+    } else if (hasLandscape && hasPortrait) {
+        if (LCDynamicOrientationActive && UIInterfaceOrientationIsLandscape(LCDynamicOrientation)) {
+            LCApplyDynamicOrientation(UIInterfaceOrientationPortrait);
+        } else {
+            LCApplyDynamicOrientation(UIInterfaceOrientationLandscapeRight);
+        }
+    }
+
+    void (^wrappedErrorHandler)(NSError *) = ^(NSError *error) {
+        if (error) {
+            NSLog(@"[LC] System requestGeometryUpdate: %@ (handled dynamically by LiveContainer)", error.localizedDescription);
+        }
+    };
+    [self hook_requestGeometryUpdateWithPreferences:preferences errorHandler:wrappedErrorHandler];
+}
+
+- (UIInterfaceOrientation)hook_interfaceOrientation {
+    if (LCOrientationLock != UIInterfaceOrientationUnknown) {
+        return LCOrientationLock;
+    }
+    if (LCDynamicOrientationActive && LCDynamicOrientation != UIInterfaceOrientationUnknown) {
+        return LCDynamicOrientation;
+    }
+    return [self hook_interfaceOrientation];
+}
+@end
+
+@implementation UIApplication (LiveContainerOrientationHook)
+- (UIInterfaceOrientation)hook_statusBarOrientation {
+    if (LCOrientationLock != UIInterfaceOrientationUnknown) {
+        return LCOrientationLock;
+    }
+    if (LCDynamicOrientationActive && LCDynamicOrientation != UIInterfaceOrientationUnknown) {
+        return LCDynamicOrientation;
+    }
+    return [self hook_statusBarOrientation];
+}
+
+- (UIInterfaceOrientationMask)hook_supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    if (LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
+        return UIInterfaceOrientationMaskLandscape;
+    } else if (LCOrientationLock == UIInterfaceOrientationPortrait) {
+        return UIInterfaceOrientationMaskPortrait;
+    }
+    if (LCDynamicOrientationActive) {
+        if (UIInterfaceOrientationIsLandscape(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskLandscape;
+        } else if (UIInterfaceOrientationIsPortrait(LCDynamicOrientation)) {
+            return UIInterfaceOrientationMaskPortrait;
+        }
+    }
+    return [self hook_supportedInterfaceOrientationsForWindow:window];
+}
+@end
+
+@implementation UIWindow (LiveContainerWindowHook)
 - (void)hook_setAutorotates:(BOOL)autorotates forceUpdateInterfaceOrientation:(BOOL)force {
     [self hook_setAutorotates:YES forceUpdateInterfaceOrientation:YES];
 }

@@ -76,6 +76,7 @@
 
 @interface UIWindow (private)
 - (void)setAutorotates:(BOOL)autorotates forceUpdateInterfaceOrientation:(BOOL)force;
+- (void)_forceUpdateInterfaceOrientationIncludingRetargeting:(BOOL)retarget;
 @end
 
 @interface _LSOpenConfiguration : NSObject
